@@ -17,12 +17,17 @@ This is the Rust flavor of the popular JavaScript/TypeScript cron parser
 - Supports optional second-, and year granularity
 - Supports optional alternative weekday mode to use Quartz-style weekdays instead of POSIX using `with_alternative_weekdays`
 - Allows for flexible combination of DOM and DOW conditions, enabling patterns to match specific days of the week in specific weeks of the month or the closest weekday to a specific day.
-- Compatible with `chrono` and (optionally) `chrono-tz`.
+- Compatible with `chrono` (and optionally `chrono-tz`) as well as `jiff`.
 - Robust error handling.
 
 ## Crate Features
 
+- `chrono` *(default)*: Enables scheduling with [`chrono::DateTime`](https://docs.rs/chrono/0.4/chrono/struct.DateTime.html) and [`chrono::NaiveDateTime`](https://docs.rs/chrono/0.4/chrono/struct.NaiveDateTime.html).
+- `jiff`: Enables scheduling with [`jiff::Zoned`](https://docs.rs/jiff/0.2/jiff/struct.Zoned.html) and [`jiff::civil::DateTime`](https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html).
 - `serde`: Enables [`serde::Serialize`](https://docs.rs/serde/1/serde/trait.Serialize.html) and [`serde::Deserialize`](https://docs.rs/serde/1/serde/trait.Deserialize.html) implementations for [`Cron`](https://docs.rs/croner/2/croner/struct.Cron.html). This feature is disabled by default.
+
+Both date and time features can be enabled at the same time. See
+[Date and time libraries](#date-and-time-libraries) below.
 
 ## Why croner instead of cron or saffron?
 
@@ -45,6 +50,7 @@ Croner combines the features of cron and saffron, while following the POSIX/Vixi
 | Weekday/Month text representations |  X   |    X    |   X   |
 | Aliases (`@hourly` etc.) |  X           |     X      |          |
 | chrono `DateTime` compatibility |    X     |     X   |   X    |
+| jiff `Zoned` compatibility |    X     |        |        |
 | Option to force DOM-and-DOW |    X     |           |         |
 | Generate human readable string |    X     |           |    X    |
 
@@ -70,7 +76,8 @@ croner = "3.0.1" # Adjust the version as necessary
 ### Usage
 
 Here's a quick example to get you started with matching current time, and
-finding the next occurrence. `is_time_matching` takes a `chrono` `DateTime`:
+finding the next occurrence. `is_time_matching` takes any supported date and
+time type, such as a `chrono` `DateTime`:
 
 ```rust
 use croner::Cron;
@@ -153,6 +160,52 @@ fn main() {
     }
 }
 ```
+
+### Date and time libraries
+
+Croner works with both `chrono` and `jiff`. Every search method is generic over
+the `CronDateTime` trait and gives back the same type that you pass in, so the
+type you write decides which library croner uses:
+
+| Type | Crate feature |
+|------|---------------|
+| `chrono::DateTime<Tz>` | `chrono` (default) |
+| `chrono::NaiveDateTime` | `chrono` (default) |
+| `jiff::Zoned` | `jiff` |
+| `jiff::civil::DateTime` | `jiff` |
+
+To use `jiff` instead of `chrono`, turn off the default features:
+
+```toml
+[dependencies]
+croner = { version = "3.0.1", default-features = false, features = ["jiff"] }
+```
+
+```rust
+use std::str::FromStr as _;
+
+use croner::Cron;
+use jiff::Zoned;
+
+fn main() {
+    let cron = Cron::from_str("18 * * * 5").expect("Couldn't parse cron string");
+
+    // The return type follows the argument type, so `next` is a `jiff::Zoned`
+    // in the same time zone as `now`.
+    let now = Zoned::now().in_tz("America/New_York").unwrap();
+    let next = cron.find_next_occurrence(&now, false).unwrap();
+
+    println!("Pattern \"{}\" will match next time at {next}", cron.pattern);
+}
+```
+
+Enable both features to use both libraries in the same program. To connect a
+library that croner does not include, implement `CronDateTime` for its type.
+
+Croner runs its search on its own wall clock types, `CivilDate` and
+`CivilDateTime`, so a pattern gives the same result with every library. The
+date and time library is used only to read the wall clock time and to resolve
+the result back into an instant in its time zone.
 
 ### Pattern
 
@@ -362,7 +415,7 @@ For detailed usage and API documentation, visit
 
 ## Time and Calendar System
 
-Croner uses the `chrono` crate, which operates on a **proleptic Gregorian calendar**. This means it treats all dates, historical or future, as if the Gregorian calendar has always been in effect. Consequently, it does not account for historical calendar reforms (e.g., skipped days during the 1582 Gregorian adoption) and will iterate through all dates uniformly.
+Croner operates on a **proleptic Gregorian calendar**, the same calendar that `chrono` and `jiff` use. This means it treats all dates, historical or future, as if the Gregorian calendar has always been in effect. Consequently, it does not account for historical calendar reforms (e.g., skipped days during the 1582 Gregorian adoption) and will iterate through all dates uniformly.
 For stability and practical use, Croner supports dates from **year 1 AD/CE** up to the beginning of **year 5000**, preventing searches that are too far into the past or future.
 
 ### Daylight Saving Time (DST) Handling

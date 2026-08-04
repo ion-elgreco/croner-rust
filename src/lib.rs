@@ -8,17 +8,33 @@
 //! - Evaluates cron patterns to calculate upcoming and previous execution times.
 //! - Supports time zone-aware scheduling.
 //! - Offers granularity up to seconds for precise task scheduling.
-//! - Compatible with the `chrono` library for dealing with date and time in Rust.
+//! - Works with both the `chrono` and the `jiff` date and time libraries.
 //!
 //! ## Crate Features
+//! - `chrono` *(default)*: Enables scheduling with
+//!   [`chrono::DateTime`](https://docs.rs/chrono/0.4/chrono/struct.DateTime.html) and
+//!   [`chrono::NaiveDateTime`](https://docs.rs/chrono/0.4/chrono/struct.NaiveDateTime.html).
+//! - `jiff`: Enables scheduling with
+//!   [`jiff::Zoned`](https://docs.rs/jiff/0.2/jiff/struct.Zoned.html) and
+//!   [`jiff::civil::DateTime`](https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html).
 //! - `serde`: Enables [`serde::Serialize`](https://docs.rs/serde/1/serde/trait.Serialize.html) and
 //!   [`serde::Deserialize`](https://docs.rs/serde/1/serde/trait.Deserialize.html) implementations for
 //!   [`Cron`](struct.Cron.html). This feature is disabled by default.
+//!
+//! Both date and time features can be on at the same time. Every search method
+//! is generic over the [`CronDateTime`] trait and returns the same type that you
+//! give it, so the type you write decides which library croner uses. To drop
+//! `chrono`, disable the default features:
+//!
+//! ```toml
+//! croner = { version = "3", default-features = false, features = ["jiff"] }
+//! ```
 //!
 //! ## Example
 //! The following example demonstrates how to use Croner to parse a cron expression and find the next and previous occurrences.
 //!
 //! ```rust
+//! # #[cfg(feature = "chrono")] {
 //! use std::str::FromStr as _;
 //!
 //! use chrono::Utc;
@@ -45,6 +61,24 @@
 //!     cron.pattern.to_string(),
 //!     previous
 //! );
+//! # }
+//! ```
+//!
+//! The same pattern with `jiff`. Only the date and time type changes:
+//!
+//! ```rust
+//! # #[cfg(feature = "jiff")] {
+//! use std::str::FromStr as _;
+//!
+//! use croner::Cron;
+//! use jiff::Zoned;
+//!
+//! let cron = Cron::from_str("0 0 * * FRI").expect("Successful parsing");
+//! let now = Zoned::now();
+//!
+//! // `next` is a `jiff::Zoned`, in the same time zone as `now`.
+//! let next = cron.find_next_occurrence(&now, false).unwrap();
+//! # }
 //! ```
 //!
 //! In this example, `Cron::from_str("0 0 * * FRI")` creates a new Cron instance for the pattern that represents every Friday at midnight. The `find_next_occurrence` method calculates the next time this pattern will be true from the current moment.
@@ -87,9 +121,12 @@
 //!
 //! For more information, refer to the full [README](https://github.com/hexagon/croner-rust).
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod describe;
 pub mod errors;
 pub mod parser;
+pub mod time;
 
 mod component;
 mod iterator;
@@ -100,6 +137,27 @@ mod pattern;
 pub enum Direction {
     Forward,
     Backward,
+}
+
+impl Direction {
+    /// Returns one step in the search direction: `1` forwards and `-1`
+    /// backwards. The unit is whatever the caller adds it to.
+    pub(crate) const fn step(self) -> i64 {
+        match self {
+            Direction::Forward => 1,
+            Direction::Backward => -1,
+        }
+    }
+
+    /// Returns the time of day that lower-order components reset to: the start
+    /// of the range when searching forwards, the end of it when searching
+    /// backwards.
+    pub(crate) const fn reset_time(self) -> CivilTime {
+        match self {
+            Direction::Forward => CivilTime::MIDNIGHT,
+            Direction::Backward => CivilTime::END_OF_DAY,
+        }
+    }
 }
 #[derive(PartialEq, Eq, Ord, PartialOrd, Hash, Clone, Copy, Debug)]
 pub enum TimeComponent {
@@ -125,7 +183,7 @@ use parser::CronParser;
 use pattern::CronPattern;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+pub use time::{CivilDate, CivilDateTime, CivilTime, CronDateTime, Resolution, Weekday};
 
 #[cfg(feature = "serde")]
 use core::fmt;
@@ -171,13 +229,14 @@ impl Cron {
     ///
     /// # Parameters
     ///
-    /// - `time`: A reference to the `DateTime<Tz>` to be checked against the cron pattern.
+    /// - `time`: A reference to any [`CronDateTime`], such as a `chrono` `DateTime<Tz>`
+    ///   or a `jiff` `Zoned`.
     ///
     /// # Returns
     ///
     /// - `Ok(bool)`: `true` if `time` matches the cron pattern, `false` otherwise.
     /// - `Err(CronError)`: An error if there is a problem checking any of the pattern fields
-    ///   against the provided `DateTime`.
+    ///   against the provided date and time.
     ///
     /// # Errors
     ///
@@ -187,6 +246,7 @@ impl Cron {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "chrono")] {
     /// use std::str::FromStr as _;
     ///
     /// use croner::Cron;
@@ -207,17 +267,23 @@ impl Cron {
     ///     if matches_all { "match" } else { "not match" },
     ///     time
     /// );
+    /// # }
     /// ```
-    pub fn is_time_matching<Tz: TimeZone>(&self, time: &DateTime<Tz>) -> Result<bool, CronError> {
-        let naive_time = time.naive_local();
-        Ok(self.pattern.second_match(naive_time.second())?
-            && self.pattern.minute_match(naive_time.minute())?
-            && self.pattern.hour_match(naive_time.hour())?
+    pub fn is_time_matching<T: CronDateTime>(&self, time: &T) -> Result<bool, CronError> {
+        self.is_civil_time_matching(time.to_civil())
+    }
+
+    /// Evaluates if a wall clock date and time matches the cron pattern.
+    #[inline]
+    fn is_civil_time_matching(&self, civil: CivilDateTime) -> Result<bool, CronError> {
+        Ok(self.pattern.second_match(civil.second())?
+            && self.pattern.minute_match(civil.minute())?
+            && self.pattern.hour_match(civil.hour())?
             && self
                 .pattern
-                .day_match(naive_time.year(), naive_time.month(), naive_time.day())?
-            && self.pattern.month_match(naive_time.month())?
-            && self.pattern.year_match(naive_time.year())?) // Add year match check
+                .day_match(civil.year(), civil.month(), civil.day())?
+            && self.pattern.month_match(civil.month())?
+            && self.pattern.year_match(civil.year())?) // Add year match check
     }
 
     /// Finds the next occurrence of a scheduled time that matches the cron pattern.
@@ -231,12 +297,13 @@ impl Cron {
     ///
     /// # Parameters
     ///
-    /// - `start_time`: A reference to a `DateTime<Tz>` indicating the start time for the search.
+    /// - `start_time`: A reference to any [`CronDateTime`] indicating the start time for the search.
     /// - `inclusive`: A `bool` that specifies whether the search should include `start_time` itself.
     ///
     /// # Returns
     ///
-    /// - `Ok(DateTime<Tz>)`: The next occurrence that matches the cron pattern.
+    /// - `Ok(T)`: The next occurrence that matches the cron pattern, as the same type as
+    ///   `start_time`.
     /// - `Err(CronError)`: An error if the next occurrence cannot be found within a reasonable
     ///   limit, if any of the date/time manipulations result in an invalid date, or if the
     ///   cron pattern match fails.
@@ -253,6 +320,7 @@ impl Cron {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "chrono")] {
     /// use chrono::Utc;
     /// use croner::{Cron, parser::{Seconds, CronParser}};
     ///
@@ -268,45 +336,41 @@ impl Cron {
     ///     cron.pattern.to_string(),
     ///     next
     /// );
+    /// # }
     /// ```
-    pub fn find_next_occurrence<Tz: TimeZone>(
+    pub fn find_next_occurrence<T: CronDateTime>(
         &self,
-        start_time: &DateTime<Tz>,
+        start_time: &T,
         inclusive: bool,
-    ) -> Result<DateTime<Tz>, CronError> {
+    ) -> Result<T, CronError> {
         self.find_occurrence(start_time, inclusive, Direction::Forward)
             .map(|(dt, _)| dt)
     }
 
     /// Finds the previous occurrence of a scheduled time that matches the cron pattern.
-    pub fn find_previous_occurrence<Tz: TimeZone>(
+    pub fn find_previous_occurrence<T: CronDateTime>(
         &self,
-        start_time: &DateTime<Tz>,
+        start_time: &T,
         inclusive: bool,
-    ) -> Result<DateTime<Tz>, CronError> {
+    ) -> Result<T, CronError> {
         self.find_occurrence(start_time, inclusive, Direction::Backward)
-            .map(|(dt, _)| dt) // Take only the first element (DateTime<Tz>)
+            .map(|(dt, _)| dt) // Take only the first element
     }
 
     /// The main generic search function.
     /// Returns (found_datetime, optional_second_ambiguous_datetime_if_any)
-    fn find_occurrence<Tz: TimeZone>(
+    fn find_occurrence<T: CronDateTime>(
         &self,
-        start_time: &DateTime<Tz>,
+        start_time: &T,
         inclusive: bool,
         direction: Direction,
-    ) -> Result<(DateTime<Tz>, Option<DateTime<Tz>>), CronError> {
-        let mut naive_time = start_time.naive_local();
-        let timezone = start_time.timezone();
+    ) -> Result<(T, Option<T>), CronError> {
+        let mut naive_time = start_time.to_civil();
         let mut job_type: Option<JobType> = None;
 
         let initial_adjusted_naive_time = if !inclusive {
-            let adjustment = match direction {
-                Direction::Forward => Duration::seconds(1),
-                Direction::Backward => Duration::seconds(-1),
-            };
             naive_time
-                .checked_add_signed(adjustment)
+                .checked_add_seconds(direction.step())
                 .ok_or(CronError::InvalidTime)?
         } else {
             naive_time
@@ -343,26 +407,11 @@ impl Cron {
             }
 
             if changed_component_in_this_pass {
-                match direction {
-                    Direction::Forward => {
-                        naive_time = naive_time
-                            .with_hour(0)
-                            .unwrap()
-                            .with_minute(0)
-                            .unwrap()
-                            .with_second(0)
-                            .unwrap()
-                    }
-                    Direction::Backward => {
-                        naive_time = naive_time
-                            .with_hour(23)
-                            .unwrap()
-                            .with_minute(59)
-                            .unwrap()
-                            .with_second(59)
-                            .unwrap()
-                    }
+                naive_time = match direction {
+                    Direction::Forward => naive_time.with_time(0, 0, 0),
+                    Direction::Backward => naive_time.with_time(23, 59, 59),
                 }
+                .ok_or(CronError::InvalidTime)?;
             }
 
             let mut time_component_adjusted_in_this_pass = false;
@@ -386,121 +435,99 @@ impl Cron {
                 )?;
             }
 
-            match from_naive(naive_time, &timezone) {
-                chrono::LocalResult::Single(dt) => {
-                    if self.is_time_matching(&dt)? {
+            // Every value that `resolve_civil` returns carries `naive_time` as
+            // its wall clock time, and the pattern only looks at the wall
+            // clock. So the pattern is checked once, on `naive_time` itself,
+            // instead of converting each resolved value back.
+            match start_time.resolve_civil(naive_time)? {
+                Resolution::Single(dt) => {
+                    debug_assert_eq!(
+                        dt.to_civil(),
+                        naive_time,
+                        "CronDateTime::resolve_civil must return the wall clock time it was given"
+                    );
+                    if self.is_civil_time_matching(naive_time)? {
                         return Ok((dt, None)); // Single match, no second ambiguous time
                     }
                     naive_time = naive_time
-                        .checked_add_signed(match direction {
-                            Direction::Forward => Duration::seconds(1),
-                            Direction::Backward => Duration::seconds(-1),
-                        })
+                        .checked_add_seconds(direction.step())
                         .ok_or(CronError::InvalidTime)?;
                 }
-                chrono::LocalResult::Ambiguous(_dt1, _dt2) => {
+                Resolution::Ambiguous(first_occurrence_dt, second_occurrence_dt) => {
                     // DST Overlap (Fall Back)
-                    let first_occurrence_dt = timezone
-                        .from_local_datetime(&naive_time)
-                        .earliest()
-                        .unwrap();
-                    let second_occurrence_dt =
-                        timezone.from_local_datetime(&naive_time).latest().unwrap();
-
-                    if *job_type.get_or_insert_with(|| self.determine_job_type())
-                        == JobType::FixedTime
-                    {
-                        // Fixed-Time Job: Execute only once, at its first occurrence (earliest in the ambiguous pair).
-                        if self.is_time_matching(&first_occurrence_dt)? {
-                            return Ok((first_occurrence_dt, None)); // Return only the first, no second for fixed jobs.
+                    debug_assert_eq!(
+                        first_occurrence_dt.to_civil(),
+                        naive_time,
+                        "CronDateTime::resolve_civil must return the wall clock time it was given"
+                    );
+                    if self.is_civil_time_matching(naive_time)? {
+                        if *job_type.get_or_insert_with(|| self.determine_job_type())
+                            == JobType::FixedTime
+                        {
+                            // Fixed-Time Job: Execute only once, at its first occurrence (earliest in the ambiguous pair).
+                            return Ok((first_occurrence_dt, None));
                         }
-                        // If fixed time doesn't match first_occurrence_dt, it means this particular naive_time
-                        // doesn't match the fixed pattern's exact time (e.g., cron is "0 0 2 *" and naive is 02:30:00).
-                        // So, we just advance to the next second and continue the loop.
-                        naive_time = naive_time
-                            .checked_add_signed(match direction {
-                                Direction::Forward => Duration::seconds(1),
-                                Direction::Backward => Duration::seconds(-1),
-                            })
-                            .ok_or(CronError::InvalidTime)?;
-                    } else {
-                        // Interval/Wildcard Job
-                        // Interval/Wildcard Job: Execute for each occurrence that matches.
-                        let mut primary_match = None;
-                        let mut secondary_match = None;
-
-                        if self.is_time_matching(&first_occurrence_dt)? {
-                            primary_match = Some(first_occurrence_dt);
-                        }
-                        if self.is_time_matching(&second_occurrence_dt)? {
-                            secondary_match = Some(second_occurrence_dt);
-                        }
-
-                        if let Some(p_match) = primary_match {
-                            return Ok((p_match, secondary_match)); // Return first, and potentially the second.
-                        } else if let Some(s_match) = secondary_match {
-                            // Only the second occurrence matched, return it as primary.
-                            return Ok((s_match, None)); // No secondary from this point.
-                        }
-                        // If neither matched the pattern for this ambiguous naive_time, advance and continue.
-                        naive_time = naive_time
-                            .checked_add_signed(match direction {
-                                Direction::Forward => Duration::seconds(1),
-                                Direction::Backward => Duration::seconds(-1),
-                            })
-                            .ok_or(CronError::InvalidTime)?;
+                        // Interval/Wildcard Job: Execute for each occurrence.
+                        return Ok((first_occurrence_dt, Some(second_occurrence_dt)));
                     }
+                    // This naive_time doesn't match the pattern's exact time
+                    // (e.g., cron is "0 0 2 *" and naive is 02:30:00).
+                    // So, we just advance to the next second and continue the loop.
+                    naive_time = naive_time
+                        .checked_add_seconds(direction.step())
+                        .ok_or(CronError::InvalidTime)?;
                 }
-                chrono::LocalResult::None => {
+                Resolution::Gap => {
                     // DST Gap (Spring Forward)
                     if *job_type.get_or_insert_with(|| self.determine_job_type())
                         == JobType::FixedTime
                     {
                         // For fixed-time jobs that fall into a gap, we want them to "snap" to the first valid time after the gap.
-                        // Find the very first valid NaiveDateTime after the current `naive_time`
-                        // that can be successfully converted to a DateTime<Tz>.
+                        // Find the very first valid wall clock time after the current `naive_time`
+                        // that can be successfully converted to a real instant.
                         let mut temp_naive = naive_time;
                         let mut gap_adjust_count = 0;
                         const MAX_GAP_SEARCH_SECONDS: u32 = 3600 * 2; // Max 2 hours for a typical gap
 
-                        let resolved_dt_after_gap: DateTime<Tz>;
+                        let resolved_dt_after_gap: T;
 
                         loop {
                             temp_naive = temp_naive
-                                .checked_add_signed(match direction {
-                                    Direction::Forward => Duration::seconds(1),
-                                    Direction::Backward => Duration::seconds(-1),
-                                })
+                                .checked_add_seconds(direction.step())
                                 .ok_or(CronError::InvalidTime)?;
                             gap_adjust_count += 1;
 
-                            // Try to resolve this `temp_naive` into a real DateTime.
-                            let local_result = from_naive(temp_naive, &timezone);
-
-                            if let chrono::LocalResult::Single(dt) = local_result {
-                                resolved_dt_after_gap = dt;
-                                break;
-                            } else if let chrono::LocalResult::Ambiguous(dt1, _) = local_result {
+                            // Try to resolve this `temp_naive` into a real instant.
+                            match start_time.resolve_civil(temp_naive)? {
+                                Resolution::Single(dt) => {
+                                    resolved_dt_after_gap = dt;
+                                    break;
+                                }
                                 // If it resolves to ambiguous (unlikely right at a gap boundary for Single), take the earliest.
-                                resolved_dt_after_gap = dt1;
-                                break;
+                                Resolution::Ambiguous(dt1, _) => {
+                                    resolved_dt_after_gap = dt1;
+                                    break;
+                                }
+                                // Keep looping if still in the gap or search limit exceeded
+                                Resolution::Gap => {}
                             }
-                            // Keep looping if still None or search limit exceeded
                             if gap_adjust_count > MAX_GAP_SEARCH_SECONDS {
                                 return Err(CronError::TimeSearchLimitExceeded);
                             }
                         }
 
-                        // `resolved_dt_after_gap` is now the first valid wall-clock time after the gap.
+                        // `resolved_dt_after_gap` is now the first valid wall-clock time after the gap,
+                        // and by the `resolve_civil` contract it carries `temp_naive`.
                         // For a fixed-time job that fell into the gap, this is the time it should run.
                         // We must ensure that its date components (year, month, day, day of week) still match the pattern.
                         // We do NOT check the original fixed hour/minute/second from the pattern, as they were "missing".
+                        let civil_after_gap = temp_naive;
                         if self.pattern.day_match(
-                            resolved_dt_after_gap.year(),
-                            resolved_dt_after_gap.month(),
-                            resolved_dt_after_gap.day(),
-                        )? && self.pattern.month_match(resolved_dt_after_gap.month())?
-                            && self.pattern.year_match(resolved_dt_after_gap.year())?
+                            civil_after_gap.year(),
+                            civil_after_gap.month(),
+                            civil_after_gap.day(),
+                        )? && self.pattern.month_match(civil_after_gap.month())?
+                            && self.pattern.year_match(civil_after_gap.year())?
                         {
                             // No need to update naive_time here
                             return Ok((resolved_dt_after_gap, None));
@@ -516,10 +543,7 @@ impl Cron {
                         // Interval/Wildcard Job in DST Gap
                         // Existing logic: simply advance by one second/minute
                         naive_time = naive_time
-                            .checked_add_signed(match direction {
-                                Direction::Forward => Duration::seconds(1),
-                                Direction::Backward => Duration::seconds(-1),
-                            })
+                            .checked_add_seconds(direction.step())
                             .ok_or(CronError::InvalidTime)?;
                     }
                 }
@@ -533,17 +557,17 @@ impl Cron {
     ///
     /// # Arguments
     ///
-    /// * `start_from` - A `DateTime<Tz>` that represents the starting point for the iterator.
+    /// * `start_from` - Any [`CronDateTime`] that represents the starting point for the iterator.
     /// * `direction` - A `Direction` to specify the search direction.
     ///
     /// # Returns
     ///
-    /// Returns a `CronIterator<Tz>` that can be used to iterate over scheduled times.
-    pub fn iter_from<Tz: TimeZone>(
+    /// Returns a `CronIterator<T>` that can be used to iterate over scheduled times.
+    pub fn iter_from<T: CronDateTime>(
         &self,
-        start_from: DateTime<Tz>,
+        start_from: T,
         direction: Direction,
-    ) -> CronIterator<Tz> {
+    ) -> CronIterator<T> {
         CronIterator::new(self.clone(), start_from, true, direction)
     }
 
@@ -551,12 +575,12 @@ impl Cron {
     ///
     /// # Arguments
     ///
-    /// * `start_after` - A `DateTime<Tz>` that represents the starting point for the iterator.
+    /// * `start_after` - Any [`CronDateTime`] that represents the starting point for the iterator.
     ///
     /// # Returns
     ///
-    /// Returns a `CronIterator<Tz>` that can be used to iterate over scheduled times.
-    pub fn iter_after<Tz: TimeZone>(&self, start_after: DateTime<Tz>) -> CronIterator<Tz> {
+    /// Returns a `CronIterator<T>` that can be used to iterate over scheduled times.
+    pub fn iter_after<T: CronDateTime>(&self, start_after: T) -> CronIterator<T> {
         CronIterator::new(self.clone(), start_after, false, Direction::Forward)
     }
 
@@ -564,12 +588,12 @@ impl Cron {
     ///
     /// # Arguments
     ///
-    /// * `start_before` - A `DateTime<Tz>` that represents the starting point for the iterator.
+    /// * `start_before` - Any [`CronDateTime`] that represents the starting point for the iterator.
     ///
     /// # Returns
     ///
-    /// Returns a `CronIterator<Tz>` that can be used to iterate over scheduled times.
-    pub fn iter_before<Tz: TimeZone>(&self, start_before: DateTime<Tz>) -> CronIterator<Tz> {
+    /// Returns a `CronIterator<T>` that can be used to iterate over scheduled times.
+    pub fn iter_before<T: CronDateTime>(&self, start_before: T) -> CronIterator<T> {
         CronIterator::new(self.clone(), start_before, false, Direction::Backward)
     }
 
@@ -624,148 +648,118 @@ impl Cron {
 
     /// Sets a time component and resets lower-order ones based on direction.
     fn set_time_component(
-        current_time: &mut NaiveDateTime,
+        current_time: &mut CivilDateTime,
         component: TimeComponent,
         value: u32,
         direction: Direction,
     ) -> Result<(), CronError> {
-        let mut new_time = *current_time;
-
-        new_time = match component {
-            TimeComponent::Second => new_time.with_second(value).ok_or(CronError::InvalidTime)?,
-            TimeComponent::Minute => new_time.with_minute(value).ok_or(CronError::InvalidTime)?,
-            TimeComponent::Hour => new_time.with_hour(value).ok_or(CronError::InvalidTime)?,
+        let new_time = match component {
+            TimeComponent::Second => current_time.with_second(value),
+            TimeComponent::Minute => current_time.with_minute(value),
+            TimeComponent::Hour => current_time.with_hour(value),
             _ => return Err(CronError::InvalidTime),
-        };
-
-        match direction {
-            Direction::Forward => {
-                if component >= TimeComponent::Hour {
-                    new_time = new_time.with_minute(0).unwrap();
-                }
-                if component >= TimeComponent::Minute {
-                    new_time = new_time.with_second(0).unwrap();
-                }
-            }
-            Direction::Backward => {
-                if component >= TimeComponent::Hour {
-                    new_time = new_time.with_minute(59).unwrap();
-                }
-                if component >= TimeComponent::Minute {
-                    new_time = new_time.with_second(59).unwrap();
-                }
-            }
         }
+        .ok_or(CronError::InvalidTime)?;
 
-        *current_time = new_time;
+        *current_time = Self::reset_lower_components(new_time, component, direction);
         Ok(())
     }
 
     /// Adjusts a time component up or down, resetting lower-order ones.
     fn adjust_time_component(
-        current_time: &mut NaiveDateTime,
+        current_time: &mut CivilDateTime,
         component: TimeComponent,
         direction: Direction,
     ) -> Result<(), CronError> {
         // Check for limits
         match direction {
-            Direction::Forward => {
-                if current_time.year() >= YEAR_UPPER_LIMIT {
-                    return Err(CronError::TimeSearchLimitExceeded);
-                }
+            Direction::Forward if current_time.year() >= YEAR_UPPER_LIMIT => {
+                return Err(CronError::TimeSearchLimitExceeded)
             }
-            Direction::Backward => {
-                if current_time.year() <= YEAR_LOWER_LIMIT {
-                    return Err(CronError::TimeSearchLimitExceeded);
-                }
+            Direction::Backward if current_time.year() <= YEAR_LOWER_LIMIT => {
+                return Err(CronError::TimeSearchLimitExceeded)
             }
+            _ => {}
         }
-        match direction {
-            Direction::Forward => {
-                let duration = match component {
-                    TimeComponent::Year => {
-                        let next_year = current_time.year() + 1;
-                        *current_time = NaiveDate::from_ymd_opt(next_year, 1, 1)
-                            .ok_or(CronError::InvalidDate)?
-                            .and_hms_opt(0, 0, 0)
-                            .ok_or(CronError::InvalidTime)?;
-                        return Ok(());
-                    }
-                    TimeComponent::Minute => Duration::minutes(1),
-                    TimeComponent::Hour => Duration::hours(1),
-                    TimeComponent::Day => Duration::days(1),
-                    TimeComponent::Month => {
-                        let mut year = current_time.year();
-                        let mut month = current_time.month() + 1;
-                        if month > 12 {
-                            year += 1;
-                            month = 1;
-                        }
-                        *current_time = NaiveDate::from_ymd_opt(year, month, 1)
-                            .ok_or(CronError::InvalidDate)?
-                            .and_hms_opt(0, 0, 0)
-                            .ok_or(CronError::InvalidTime)?;
-                        return Ok(());
-                    }
-                    _ => return Err(CronError::InvalidTime),
+
+        // Stepping a date component always lands on the far edge of the
+        // neighbouring unit, so the date is moved directly and the time of day
+        // is written whole. Only the sub-day components need to carry the
+        // current time of day forward.
+        let date = match component {
+            TimeComponent::Year => match direction {
+                Direction::Forward => CivilDate::from_ymd(current_time.year() + 1, 1, 1)?,
+                Direction::Backward => CivilDate::from_ymd(current_time.year() - 1, 12, 31)?,
+            },
+            TimeComponent::Month => {
+                let first_of_month =
+                    CivilDate::from_ymd(current_time.year(), current_time.month(), 1)?;
+                let step = match direction {
+                    // The first day of the next month.
+                    Direction::Forward => i64::from(first_of_month.days_in_month()),
+                    // The last day of the previous month.
+                    Direction::Backward => -1,
                 };
-                *current_time = current_time
-                    .checked_add_signed(duration)
-                    .ok_or(CronError::InvalidTime)?;
-                if component >= TimeComponent::Day {
-                    *current_time = current_time.with_hour(0).unwrap();
-                }
-                if component >= TimeComponent::Hour {
-                    *current_time = current_time.with_minute(0).unwrap();
-                }
-                if component >= TimeComponent::Minute {
-                    *current_time = current_time.with_second(0).unwrap();
-                }
+                first_of_month
+                    .checked_add_days(step)
+                    .ok_or(CronError::InvalidDate)?
             }
-            Direction::Backward => {
-                let duration = match component {
-                    TimeComponent::Year => {
-                        // Tillagd logik för år
-                        let prev_year = current_time.year() - 1;
-                        *current_time = NaiveDate::from_ymd_opt(prev_year, 12, 31)
-                            .ok_or(CronError::InvalidDate)?
-                            .and_hms_opt(23, 59, 59)
-                            .ok_or(CronError::InvalidTime)?;
-                        return Ok(());
-                    }
-                    TimeComponent::Minute => Duration::minutes(1),
-                    TimeComponent::Hour => Duration::hours(1),
-                    TimeComponent::Day => Duration::days(1),
-                    TimeComponent::Month => {
-                        let next_month_first_day =
-                            NaiveDate::from_ymd_opt(current_time.year(), current_time.month(), 1)
-                                .ok_or(CronError::InvalidDate)?;
-                        *current_time = (next_month_first_day - Duration::days(1))
-                            .and_hms_opt(23, 59, 59)
-                            .ok_or(CronError::InvalidTime)?;
-                        return Ok(());
-                    }
-                    _ => return Err(CronError::InvalidTime),
+            TimeComponent::Day => current_time
+                .date()
+                .checked_add_days(direction.step())
+                .ok_or(CronError::InvalidDate)?,
+            TimeComponent::Hour | TimeComponent::Minute => {
+                let step_seconds = if component == TimeComponent::Hour {
+                    3600
+                } else {
+                    60
                 };
-                *current_time = current_time
-                    .checked_sub_signed(duration)
+                let stepped = current_time
+                    .checked_add_seconds(step_seconds * direction.step())
                     .ok_or(CronError::InvalidTime)?;
-                if component >= TimeComponent::Day {
-                    *current_time = current_time.with_hour(23).unwrap();
-                }
-                if component >= TimeComponent::Hour {
-                    *current_time = current_time.with_minute(59).unwrap();
-                }
-                if component >= TimeComponent::Minute {
-                    *current_time = current_time.with_second(59).unwrap();
-                }
+                *current_time = Self::reset_lower_components(stepped, component, direction);
+                return Ok(());
             }
-        }
+            TimeComponent::Second => return Err(CronError::InvalidTime),
+        };
+
+        *current_time = CivilDateTime::new(date, direction.reset_time());
         Ok(())
+    }
+
+    /// Resets every time component below `component` to the start of its range
+    /// when searching forwards, or the end of it when searching backwards.
+    fn reset_lower_components(
+        time: CivilDateTime,
+        component: TimeComponent,
+        direction: Direction,
+    ) -> CivilDateTime {
+        let reset = direction.reset_time();
+        // The reset values are constants in range, so no check is needed.
+        CivilDateTime::new(
+            time.date(),
+            CivilTime::from_parts_unchecked(
+                if component >= TimeComponent::Day {
+                    reset.hour()
+                } else {
+                    time.hour()
+                },
+                if component >= TimeComponent::Hour {
+                    reset.minute()
+                } else {
+                    time.minute()
+                },
+                if component >= TimeComponent::Minute {
+                    reset.second()
+                } else {
+                    time.second()
+                },
+            ),
+        )
     }
     fn find_matching_date_component(
         &self,
-        current_time: &mut NaiveDateTime,
+        current_time: &mut CivilDateTime,
         direction: Direction,
         component: TimeComponent,
     ) -> Result<bool, CronError> {
@@ -790,7 +784,7 @@ impl Cron {
     /// Consolidated helper for time-based components (Hour, Minute, Second).
     fn find_matching_granular_component(
         &self,
-        current_time: &mut NaiveDateTime,
+        current_time: &mut CivilDateTime,
         direction: Direction,
         component: TimeComponent,
     ) -> Result<bool, CronError> {
@@ -832,6 +826,7 @@ impl std::fmt::Display for Cron {
 }
 
 #[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 impl Serialize for Cron {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -842,6 +837,7 @@ impl Serialize for Cron {
 }
 
 #[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 impl<'de> Deserialize<'de> for Cron {
     fn deserialize<D>(deserializer: D) -> Result<Cron, D::Error>
     where
@@ -868,27 +864,32 @@ impl<'de> Deserialize<'de> for Cron {
     }
 }
 
-// Convert `NaiveDateTime` back to `DateTime<Tz>`
-pub fn from_naive<Tz: TimeZone>(
-    naive_time: NaiveDateTime,
+/// Convert `NaiveDateTime` back to `DateTime<Tz>`
+///
+/// Kept for backwards compatibility. It is a thin wrapper around
+/// [`chrono::TimeZone::from_local_datetime`] and croner no longer uses it:
+/// wall clock times are resolved through [`CronDateTime::resolve_civil`],
+/// which works with every supported date and time library.
+#[cfg(feature = "chrono")]
+#[cfg_attr(docsrs, doc(cfg(feature = "chrono")))]
+pub fn from_naive<Tz: chrono::TimeZone>(
+    naive_time: chrono::NaiveDateTime,
     timezone: &Tz,
-) -> chrono::LocalResult<DateTime<Tz>> {
-    timezone.from_local_datetime(&naive_time)
+) -> chrono::LocalResult<chrono::DateTime<Tz>> {
+    chrono::TimeZone::from_local_datetime(timezone, &naive_time)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "chrono"))]
 mod tests {
     use std::hash::{DefaultHasher, Hash, Hasher as _};
 
     use crate::parser::Seconds;
 
     use super::*;
-    use chrono::{Local, TimeZone};
+    use chrono::{Datelike, Local, TimeZone, Timelike};
     use chrono_tz::Tz;
 
     use rstest::rstest;
-    #[cfg(feature = "serde")]
-    use serde_test::{assert_de_tokens_error, assert_tokens, Token};
     #[test]
     fn test_is_time_matching() -> Result<(), CronError> {
         // This pattern is meant to match first second of 9 am on the first day of January.
@@ -1766,36 +1767,6 @@ mod tests {
         assert!(cron_1 == cron_2, "Patterns are not equal");
     }
 
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_serde_tokens() {
-        let cron = Cron::from_str("0 0 * * *").expect("should be valid pattern");
-        assert_tokens(&cron.to_string(), &[Token::Str("0 0 * * *")]);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_shorthand_serde_tokens() {
-        let expressions = [
-            ("@daily", "0 0 * * *"),
-            ("0 12 * * MON", "0 12 * * 1"),
-            ("*/15 9-17 * * MON-FRI", "*/15 9-17 * * 1-5"),
-        ];
-        for (shorthand, expected) in expressions.iter() {
-            let cron = Cron::from_str(shorthand).expect("should be valid pattern");
-            assert_tokens(&cron.to_string(), &[Token::Str(expected)]);
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_invalid_serde_tokens() {
-        assert_de_tokens_error::<Cron>(
-            &[Token::Str("Invalid cron pattern")],
-            "Invalid pattern: Pattern must have between 5 and 7 fields.",
-        );
-    }
-
     #[test]
     fn test_find_previous_occurrence() -> Result<(), CronError> {
         let cron = Cron::from_str("* * * * *")?;
@@ -2151,5 +2122,41 @@ mod tests {
         ); // 4 AM CET - this is not ambiguous, so earlier() is fine
 
         Ok(())
+    }
+}
+
+// The serde support does not depend on a date and time backend, so these tests
+// run whichever backend is enabled.
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    use serde_test::{assert_de_tokens_error, assert_tokens, Token};
+
+    #[test]
+    fn test_serde_tokens() {
+        let cron = Cron::from_str("0 0 * * *").expect("should be valid pattern");
+        assert_tokens(&cron.to_string(), &[Token::Str("0 0 * * *")]);
+    }
+
+    #[test]
+    fn test_shorthand_serde_tokens() {
+        let expressions = [
+            ("@daily", "0 0 * * *"),
+            ("0 12 * * MON", "0 12 * * 1"),
+            ("*/15 9-17 * * MON-FRI", "*/15 9-17 * * 1-5"),
+        ];
+        for (shorthand, expected) in expressions.iter() {
+            let cron = Cron::from_str(shorthand).expect("should be valid pattern");
+            assert_tokens(&cron.to_string(), &[Token::Str(expected)]);
+        }
+    }
+
+    #[test]
+    fn test_invalid_serde_tokens() {
+        assert_de_tokens_error::<Cron>(
+            &[Token::Str("Invalid cron pattern")],
+            "Invalid pattern: Pattern must have between 5 and 7 fields.",
+        );
     }
 }
